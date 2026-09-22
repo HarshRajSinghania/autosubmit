@@ -527,11 +527,6 @@ def postgres_server(
             yield container
 
 
-@pytest.fixture(params=[False, True])
-def use_sqlalchemy(request):
-    return request.param
-
-
 @pytest.fixture(params=["postgres", "sqlite"])
 def as_db(
     request: "FixtureRequest",
