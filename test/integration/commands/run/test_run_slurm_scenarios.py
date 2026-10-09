@@ -1078,7 +1078,7 @@ def test_inspect_wrappers(
                     "WALLCLOCK": "00:01",
                 }
             },
-            "WRAPPERS": {"TEST_WRAPPER": {"TYPE": "vertical", "JOBS_IN_WRAPPER": "A"}},
+            "WRAPPERS": {"TEST_WRAPPER": {"TYPE": "vertical","JOBS_IN_WRAPPER": "A"}}
         }
         | general_data,
         include_jobs=False,
