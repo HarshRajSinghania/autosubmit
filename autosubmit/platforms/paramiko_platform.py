@@ -584,8 +584,6 @@ class ParamikoPlatform(Platform):
                                                                   max_packet_size=pow(4, 12))
             self._ftpChannel.get_channel().settimeout(120)
             self.connected = True
-            if not log_recovery_process:
-                self.spawn_log_retrieval_process(as_conf)
         except SSHException:
             self.connected = False
             raise
@@ -604,6 +602,13 @@ class ParamikoPlatform(Platform):
             else:
                 raise AutosubmitError(
                     "Couldn't establish a connection to the specified host, wrong configuration?", 6003, str(e))
+
+        # Kept outside the try/except above so a fatal error while starting the recovery
+        # process is not turned into a recoverable connection error. The main process just
+        # connected with the same configuration, so the recovery process should start too.
+        # Failing to do so is a real problem worth aborting for.
+        if self.connected and not log_recovery_process:
+            self.spawn_log_retrieval_process(as_conf)
 
     # TODO: This may not appear as used in an IDE search, but in reality it is.
     #       It is called via a ``Platform``-typed object; ``Platform`` doesn't

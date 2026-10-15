@@ -28,11 +28,12 @@ from multiprocessing.synchronize import Event
 # noinspection PyProtectedMember
 from os import _exit  # type: ignore
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import setproctitle
 
 from autosubmit.config.basicconfig import BasicConfig
+from autosubmit.config.runtime import LogRecoveryConfig, resolve_log_recovery_queue_size
 from autosubmit.database.db_manager_job_list import JobsDbManager
 from autosubmit.helpers.parameters import autosubmit_parameter
 from autosubmit.job.job_common import Status
@@ -49,19 +50,23 @@ if TYPE_CHECKING:
     from autosubmit.job.job_packages import JobPackageBase
 
 
-def _init_logs_log_process(as_conf: 'AutosubmitConfig', platform_name: str) -> None:
-    Log.set_console_level(as_conf.experiment_data.get("LOG_RECOVERY_CONSOLE_LEVEL", "DEBUG"))
+def _init_logs_log_process(
+        as_conf: 'AutosubmitConfig',
+        platform_name: str,
+        console_level: str = "DEBUG",
+        file_level: str = "EVERYTHING",
+) -> None:
+    Log.set_console_level(console_level)
     if as_conf.experiment_data.get("ROOTDIR", None):
         aslogs_path = Path(as_conf.experiment_data["ROOTDIR"], "tmp/ASLOGS")
         Log.set_file(
-            str(aslogs_path / f'{platform_name.lower()}_log_recovery.log'), "out",
-            as_conf.experiment_data.get("LOG_RECOVERY_FILE_LEVEL", "EVERYTHING"))
+            str(aslogs_path / f'{platform_name.lower()}_log_recovery.log'), "out", file_level)
         Log.set_file(str(aslogs_path / f'{platform_name.lower()}_log_recovery_err.log'), "err")
 
 
 def recover_platform_job_logs_wrapper(
         platform: 'Platform',
-        recovery_queue: Queue,
+        recovery_queue: 'CopyQueue',
         worker_event: Event,
         cleanup_event: Event,
         as_conf: 'AutosubmitConfig'
@@ -85,24 +90,36 @@ def recover_platform_job_logs_wrapper(
     platform.work_event = worker_event
     platform.cleanup_event = cleanup_event
     BasicConfig.read()
+    console_level = as_conf.get_log_recovery_console_level()
+    file_level = as_conf.get_log_recovery_file_level()
     as_conf.experiment_data = {
         "AS_ENV_PLATFORMS_PATH": as_conf.experiment_data.get("AS_ENV_PLATFORMS_PATH", None),
         "AS_ENV_SSH_CONFIG_PATH": as_conf.experiment_data.get("AS_ENV_SSH_CONFIG_PATH", None),
         "AS_ENV_CURRENT_USER": as_conf.experiment_data.get("AS_ENV_CURRENT_USER", None),
         "ROOTDIR": as_conf.experiment_data.get("ROOTDIR", None),
-        "LOG_RECOVERY_CONSOLE_LEVEL": as_conf.experiment_data.get("CONFIG", {}).get("LOG_RECOVERY_CONSOLE_LEVEL",
-                                                                                    "DEBUG"),
-        "LOG_RECOVERY_FILE_LEVEL": as_conf.experiment_data.get("CONFIG", {}).get("LOG_RECOVERY_FILE_LEVEL",
-                                                                                 "EVERYTHING"),
+        "LOG_RECOVERY_CONSOLE_LEVEL": console_level,
+        "LOG_RECOVERY_FILE_LEVEL": file_level,
         # CPMIP notification needs EXPERIMENT (for CALENDAR) and MAIL (for NOTIFICATIONS, TO)
         "EXPERIMENT": as_conf.experiment_data.get("EXPERIMENT", {}),
         "MAIL": as_conf.experiment_data.get("MAIL", {}),
     }
-    _init_logs_log_process(as_conf, platform.name)
+    _init_logs_log_process(as_conf, platform.name, console_level, file_level)
     platform.recover_platform_job_logs(as_conf)
     # Exit userspace after manually closing ssh sockets, recommended for child processes.
     # The queue() and shared signals should be in charge of the main process.
     _exit(0)
+
+
+class LogRecoveryJobData(TypedDict):
+    """Serialized payload stored in the log recovery queue for a single job."""
+
+    id: int | str | None
+    name: str
+    fail_count: int
+    submit_time_timestamp: str | int | None
+    start_time_timestamp: str | int | None
+    finish_time_timestamp: str | int | None
+    wrapper_type: str | None
 
 
 class CopyQueue(Queue):
@@ -126,17 +143,14 @@ class CopyQueue(Queue):
         self.timeout = timeout
         super().__init__(maxsize, ctx=ctx)
 
-    def put(self, job: Any, block: bool = True, timeout: float | None = None) -> None:
-        """Puts a job into the queue if it is not a duplicate.
+    @staticmethod
+    def job_data(job: Any) -> LogRecoveryJobData:
+        """Build the lightweight payload stored in the recovery queue for a job.
 
-        :param job: The job to be added to the queue.
-        :type job: Any
-        :param block: Whether to block when the queue is full. Defaults to True.
-        :type block: bool
-        :param timeout: Timeout for blocking operations. Defaults to None.
-        :type timeout: float
+        :param job: The job to serialize.
+        :return: A dictionary with the information required by the recovery process.
         """
-        job_data: dict = {
+        return {
             "id": job.id,
             "name": job.name,
             "fail_count": job.fail_count,
@@ -145,6 +159,16 @@ class CopyQueue(Queue):
             "finish_time_timestamp": job.finish_time_timestamp,
             "wrapper_type": job.wrapper_type,
         }
+
+    def put_raw(self, job_data: LogRecoveryJobData, block: bool = True, timeout: float | None = None) -> None:
+        """Put an already-serialized job payload back into the queue.
+
+        Used to restore jobs that were still queued when the recovery process died.
+
+        :param job_data: Payload previously produced by :meth:`job_data`.
+        :param block: Whether to block when the queue is full. Defaults to True.
+        :param timeout: Timeout for blocking operations. Defaults to None.
+        """
         super().put(job_data, block, timeout)
 
 
@@ -237,11 +261,17 @@ class Platform(ABC):
         else:
             self.pw = None
         self.max_waiting_jobs = 20
-        self.recovery_queue: Queue | None = None
+        self.recovery_queue: CopyQueue | None = None
         self.work_event: Event | None = None
         self.cleanup_event: Event | None = None
         self.log_retrieval_process_active: bool = False
         self.log_recovery_process: BaseProcess | None = None
+        # Log recovery resiliency state (see issue #3342).
+        self._pending_recovery: dict[str, LogRecoveryJobData] = {}
+        self._recovery_consecutive_failures: int = 0
+        self._log_recovery_disabled: bool = False
+        self._log_recovery_started: bool = False
+        self._log_recovery_retry_at: float = 0.0
         self.keep_alive_timeout = 60 * 5  # Useful in case of kill -9
         self.compress_remote_logs = False
         self.remote_logs_compress_type = "gzip"
@@ -249,13 +279,7 @@ class Platform(ABC):
         log_queue_size = 200
         if self.config:
             platform_config: dict = self.config.get("PLATFORMS", {}).get(self.name.upper(), {})
-            # We still support TOTALJOBS and TOTAL_JOBS for backwards compatibility... # TODO change in 4.2, I think
-            default_queue_size = self.config.get("CONFIG", {}).get("LOG_RECOVERY_QUEUE_SIZE", 100)
-            platform_default_queue_size = self.config.get("PLATFORMS", {}).get(self.name.upper(), {}).get(
-                "LOG_RECOVERY_QUEUE_SIZE", default_queue_size)
-            config_total_jobs = self.config.get("CONFIG", {}).get("TOTAL_JOBS", platform_default_queue_size)
-            platform_total_jobs = self.config.get("PLATFORMS", {}).get('TOTAL_JOBS', config_total_jobs)
-            log_queue_size = int(platform_total_jobs) * 2
+            log_queue_size = resolve_log_recovery_queue_size(self.config, self.name)
             self.compress_remote_logs = platform_config.get("COMPRESS_REMOTE_LOGS", False)
             self.remote_logs_compress_type = platform_config.get("REMOTE_LOGS_COMPRESS_TYPE", "gzip")
             self.compression_level = platform_config.get("COMPRESSION_LEVEL", 9)
@@ -787,31 +811,206 @@ class Platform(ABC):
         """
         return None
 
-    def add_job_to_log_recover(self, job):
-        if job.id and int(job.id) != 0:
-            if self.recovery_queue is None:
-                Log.warning(
-                    f"Recovery queue for {self.name} is not initialized. "
-                    f"Skipping log recovery for {job.name}.")
-                return
+    @staticmethod
+    def _log_recovery_config(as_conf: 'AutosubmitConfig | None') -> LogRecoveryConfig:
+        """Return the parsed log recovery configuration.
+
+        Defaults are used when no configuration is available.
+
+        :param as_conf: Experiment configuration.
+        :return: The parsed ``RUNTIME.LOG_RECOVERY`` configuration.
+        """
+        return as_conf.runtime.log_recovery if as_conf is not None else LogRecoveryConfig()
+
+    def _should_run_log_recovery(self, as_conf: 'AutosubmitConfig | None') -> bool:
+        """Whether a separate log recovery process is expected for this platform.
+
+        :param as_conf: Experiment configuration.
+        :return: ``True`` when recovery threads are enabled and the command is ``run``.
+        """
+        if as_conf is None or as_conf.is_recovery_threads_disabled(self.name):
+            return False
+        return as_conf.is_run_command()
+
+    def _retry_delay_elapsed(self) -> bool:
+        """Whether the retry delay set when entering fallback mode has elapsed.
+
+        :return: ``True`` when a new recovery process may be attempted again.
+        """
+        return time.time() >= self._log_recovery_retry_at
+
+    def _filter_pending_needing_recovery(self) -> dict[str, LogRecoveryJobData]:
+        """Keep only pending jobs the database still reports as needing recovery.
+
+        This drops jobs that were already recovered (their logs were persisted), including
+        the job that was in-flight when the recovery process died.
+
+        :return: Mapping of job name to payload for the jobs still needing recovery.
+        """
+        if not self._pending_recovery:
+            return {}
+        try:
+            jobs_db_manager = JobsDbManager(schema=self.expid)
+            needing = {data["name"] for data in jobs_db_manager.select_finished_jobs_needing_log_recovery()}
+        except Exception as e:
+            Log.warning(f"[{self.name}] Could not check which logs still need recovery: {e}")
+            return dict(self._pending_recovery)
+        return {name: data for name, data in self._pending_recovery.items() if name in needing}
+
+    def _requeue_pending(self) -> None:
+        """Re-queue the jobs that were still pending when the recovery process died."""
+        if self.recovery_queue is None or not self._pending_recovery:
+            return
+        for job_data in list(self._pending_recovery.values()):
             try:
-                if (self.log_recovery_process is not None
-                        and not self.log_recovery_process.is_alive()):
-                    Log.warning(
-                        f"Log recovery process for {self.name} is dead. "
-                        f"Skipping log recovery for {job.name}.")
-                    return
-                self.recovery_queue.put(job, timeout=30)
-                if self.work_event is not None:
-                    self.work_event.set()
-                Log.debug(
-                    f"Added job {job.name} and retry number:{job.fail_count} to the log recovery queue.")
+                self.recovery_queue.put_raw(job_data)
             except Exception as e:
-                Log.warning(
-                    f"Failed to add job {job.name} to log recovery queue: {e}")
-        else:
+                Log.warning(f"[{self.name}] Failed to re-queue a pending log recovery: {e}")
+        if self.work_event is not None:
+            self.work_event.set()
+
+    def _enter_fallback(self, as_conf: 'AutosubmitConfig | None') -> None:
+        """Enter fallback mode after too many consecutive restart failures.
+
+        :param as_conf: Experiment configuration.
+        """
+        Log.error(
+            f"[{self.name}] Log recovery process failed to restart "
+            f"{self._recovery_consecutive_failures} consecutive time(s).")
+        self._log_recovery_disabled = True
+        log_recovery = Platform._log_recovery_config(as_conf)
+        if log_recovery.inline_fallback:
+            self._recovery_consecutive_failures = 0
+            retry_delay = log_recovery.retry_delay
+            self._log_recovery_retry_at = time.time() + retry_delay
             Log.warning(
-                f"Job {job.name} and retry number:{job.fail_count} has no job id. Autosubmit will no record this retry. This shouldn't happen!")
+                f"[{self.name}] Falling back to inline log recovery; a separate process "
+                f"will be attempted again in {retry_delay} seconds.")
+        else:
+            # Without inline fallback there is nothing to retry in this run; the pending logs
+            # stay in the database and will be recovered on the next Autosubmit run.
+            self._log_recovery_retry_at = float("inf")
+            Log.warning(
+                f"[{self.name}] INLINE_FALLBACK is disabled; pending log recovery will be postponed.")
+
+    def _respawn_log_recovery_process(self, as_conf: 'AutosubmitConfig | None') -> bool:
+        """Restart a dead log recovery process, re-queueing the jobs that were still pending.
+
+        :param as_conf: Experiment configuration.
+        :return: ``True`` when a live recovery process is running again.
+        """
+        # Drop jobs the database already reports as recovered (covers the in-flight job too).
+        # Everything that was enqueued is already tracked in ``_pending_recovery``.
+        self._pending_recovery = self._filter_pending_needing_recovery()
+
+        Log.warning(f"[{self.name}] Log recovery process is not alive. Attempting to restart it.")
+        self.clean_log_recovery_process(keep_pending=True)
+        try:
+            self.spawn_log_retrieval_process(as_conf, first_start=False)
+        except Exception as e:
+            Log.warning(f"[{self.name}] Failed to restart the log recovery process: {e}")
+            self.log_recovery_process = None
+
+        alive = self.log_recovery_process is not None and self.log_recovery_process.is_alive()
+        if alive:
+            self._recovery_consecutive_failures = 0
+            self._requeue_pending()
+            return True
+
+        self._recovery_consecutive_failures += 1
+        max_restarts = Platform._log_recovery_config(as_conf).consecutive_max_restarts
+        if 0 < max_restarts <= self._recovery_consecutive_failures:
+            self._enter_fallback(as_conf)
+        return False
+
+    def _recover_pending_inline(self, as_conf: 'AutosubmitConfig | None') -> None:
+        """Recover pending logs synchronously in the main process (fallback).
+
+        :param as_conf: Experiment configuration.
+        """
+        if not self._pending_recovery:
+            return
+        pending = list(self._pending_recovery.items())
+        self._pending_recovery.clear()
+        try:
+            jobs_db_manager = JobsDbManager(schema=self.expid)
+        except Exception as e:
+            Log.error(f"[{self.name}] Could not initialise the jobs database for inline log recovery: {e}")
+            self._pending_recovery.update(pending)
+            return
+        for _name, job_data in pending:
+            try:
+                self._recover_single_log(job_data, jobs_db_manager, as_conf)
+            except Exception as e:
+                Log.warning(f"[{self.name}] Inline log recovery failed for job {job_data.get('name')}: {e}")
+
+    def _recover_inline_single(self, job, as_conf: 'AutosubmitConfig | None') -> bool:
+        """recover the given job's logs inline if ``RUNTIME.LOG_RECOVERY.INLINE_FALLBACK`` is enabled.
+
+        :param job: Job whose logs have to be recovered.
+        :param as_conf: Experiment configuration.
+        :return: ``True`` if the job was recovered inline, ``False`` when the fallback is disabled.
+        """
+        if not Platform._log_recovery_config(as_conf).inline_fallback:
+            return False
+        self._pending_recovery[job.name] = CopyQueue.job_data(job)
+        self._recover_pending_inline(as_conf)
+        return True
+
+    def add_job_to_log_recover(self, job, as_conf: 'AutosubmitConfig | None' = None) -> bool:
+        """Queue a job so its logs and stats can be recovered by the recovery process.
+
+        When the recovery process is dead it is restarted (re-queueing the jobs that were
+        still pending) instead of silently dropping the job. If it cannot be restarted, the
+        logs are recovered inline (when ``RUNTIME.LOG_RECOVERY.INLINE_FALLBACK`` is enabled).
+
+        :param job: Job whose logs have to be recovered.
+        :param as_conf: Experiment configuration.
+        :return: ``True`` when the job was queued (or recovered inline), ``False`` otherwise.
+        """
+        if not (job.id and int(job.id) != 0):
+            Log.warning(
+                f"Job {job.name} and retry number:{job.fail_count} has no job id. "
+                f"Autosubmit will no record this retry. This shouldn't happen!")
+            return False
+
+        if self.recovery_queue is None and not self._log_recovery_disabled:
+            Log.warning(
+                f"Recovery queue for {self.name} is not initialized. "
+                f"Skipping log recovery for {job.name}.")
+            return False
+
+        # Fallback: wait for RETRY_DELAY before trying a separate process again.
+        if self._log_recovery_disabled and not self._retry_delay_elapsed():
+            return self._recover_inline_single(job, as_conf)
+        if self._log_recovery_disabled:
+            self._log_recovery_disabled = False
+            self._recovery_consecutive_failures = 0
+
+        # A dead (or missing) recovery process must be restarted, not skipped.
+        recovery_dead = self._log_recovery_started and (
+            self.log_recovery_process is None or not self.log_recovery_process.is_alive())
+        if recovery_dead and not self._respawn_log_recovery_process(as_conf):
+            return self._recover_inline_single(job, as_conf)
+
+        if self.recovery_queue is None:
+            return self._recover_inline_single(job, as_conf)
+
+        try:
+            job_data = CopyQueue.job_data(job)
+            self.recovery_queue.put_raw(job_data, timeout=30)
+            self._pending_recovery[job.name] = job_data
+            # Bound memory on long runs: occasionally drop the jobs already recovered.
+            if len(self._pending_recovery) > self.log_queue_size:
+                self._pending_recovery = self._filter_pending_needing_recovery()
+            if self.work_event is not None:
+                self.work_event.set()
+            Log.debug(
+                f"Added job {job.name} and retry number:{job.fail_count} to the log recovery queue.")
+            return True
+        except Exception as e:
+            Log.warning(f"Failed to add job {job.name} to log recovery queue: {e}")
+            return False
 
     def connect(self, as_conf: 'AutosubmitConfig', reconnect: bool = False, log_recovery_process: bool = False) -> None:
         """Establishes an SSH connection to the host.
@@ -833,11 +1032,15 @@ class Platform(ABC):
         """
         raise NotImplementedError  # pragma: no cover
 
-    def clean_log_recovery_process(self) -> None:
+    def clean_log_recovery_process(self, keep_pending: bool = False) -> None:
         """Cleans the log recovery process variables.
 
         This method sets the cleanup event to signal the log recovery process to finish,
         waits for the process to join with a timeout, and then resets all related variables.
+
+        :param keep_pending: When ``True`` the jobs pending recovery are preserved so a new
+            process can take them over (used while respawning). When ``False`` (default) all
+            the log recovery state, including pending jobs, is reset.
         """
         if self.ctx is None:
             self.ctx = self.get_mp_context()
@@ -883,6 +1086,13 @@ class Platform(ABC):
         self.log_recovery_process = None
         self.work_event = None
         self.processed_wrapper_logs = set()
+
+        if not keep_pending:
+            self._pending_recovery = {}
+            self._recovery_consecutive_failures = 0
+            self._log_recovery_disabled = False
+            self._log_recovery_started = False
+            self._log_recovery_retry_at = 0.0
 
     def update_as_conf(self, as_conf: 'AutosubmitConfig') -> None:
         self.config = as_conf.experiment_data
@@ -970,21 +1180,49 @@ class Platform(ABC):
         else:
             Log.result("Log recovery process is not running (will not wait/join the process)")
 
-    def spawn_log_retrieval_process(self, as_conf: 'AutosubmitConfig | None') -> None:
+    def spawn_log_retrieval_process(
+            self,
+            as_conf: 'AutosubmitConfig | None',
+            first_start: bool | None = None,
+    ) -> bool:
         """Spawns a process to recover the logs of the jobs that have been completed on this platform.
 
+        The very first time the process is started, failing to start it is fatal: something is
+        wrong with the configuration/environment and Autosubmit must not keep running while
+        silently losing logs and stats. Later restarts (``first_start=False``) are tolerated and
+        handled by the caller.
+
         :param as_conf: Configuration object for the platform.
-        :type as_conf: AutosubmitConfig
+        :param first_start: Whether this is the initial start. When ``None`` it is inferred from
+            the platform state.
+        :raises AutosubmitCritical: When the initial start does not produce a live process.
+        :return: ``True`` when a live recovery process is running.
         """
-        if not self.log_retrieval_process_active and (
-                as_conf is None or str(as_conf.platforms_data.get(self.name, {}).get('DISABLE_RECOVERY_THREADS',
-                                                                                     "false")).lower() == "false"):
-            if as_conf and as_conf.misc_data.get("AS_COMMAND", "").lower() == "run":
-                self.log_retrieval_process_active = True
-                self.ctx = self.get_mp_context()
-                new_platform = self.prepare_process()
-                self.create_new_process(new_platform, as_conf)
-                self.join_new_process()
+        if first_start is None:
+            first_start = not self._log_recovery_started
+
+        if self.log_retrieval_process_active:
+            return self.log_recovery_process is not None and self.log_recovery_process.is_alive()
+
+        if not self._should_run_log_recovery(as_conf):
+            return False
+
+        self.log_retrieval_process_active = True
+        self.ctx = self.get_mp_context()
+        new_platform = self.prepare_process()
+        self.create_new_process(new_platform, as_conf)
+        self.join_new_process()
+
+        alive = self.log_recovery_process is not None and self.log_recovery_process.is_alive()
+        if first_start:
+            self._log_recovery_started = True
+            if not alive:
+                raise AutosubmitCritical(
+                    f"Could not start the log recovery process for platform {self.name}. "
+                    f"Aborting to avoid losing logs and stats.",
+                    6008,
+                )
+        return alive
 
     def send_cleanup_signal(self) -> None:
         """Sends a cleanup signal to the log recovery process if it is alive.
@@ -1027,42 +1265,87 @@ class Platform(ABC):
         self.work_event.clear()
         return process_log
 
+    def _recover_job(self, job, jobs_db_manager: 'JobsDbManager', as_conf: 'AutosubmitConfig') -> None:
+        """Recover the logs and stats of ``job`` and persist the result.
+
+        Shared by the recovery child process and the inline recovery paths.
+
+        :param job: Job to recover.
+        :param jobs_db_manager: Jobs database manager used to persist the job.
+        :param as_conf: Experiment configuration.
+        """
+        report = job.retrieve_logfiles()
+        job.send_cpmip_notification(as_conf)
+
+        if not report.all_succeeded:
+            failed = [a for a in report.attempts if a.error and "Remote logs not found" not in a.error]
+            if failed:
+                Log.warning(
+                    f"{self.name}(log_recovery): Job {job.name} had "
+                    f"{len(failed)} failed recovery attempt(s): "
+                    f"{[a.error for a in failed]}"
+                )
+            attempts = len(report.attempts) - len(failed) - 1
+        else:
+            attempts = len(report.attempts)
+        if attempts > 0:
+            Log.result(
+                f"{self.name}(log_recovery): Job {job.name} recovered "
+                f"{len(report.attempts)} attempt(s)."
+            )
+        jobs_db_manager.save_job_log(job)
+
+    def _recover_single_log(self, job_data: LogRecoveryJobData, jobs_db_manager: 'JobsDbManager',
+                            as_conf: 'AutosubmitConfig') -> None:
+        """Recover the logs and stats of a single job from its serialized payload.
+
+        :param job_data: Serialized payload of the job (at least ``name`` and ``id``).
+        :param jobs_db_manager: Jobs database manager used to load and persist the job.
+        :param as_conf: Experiment configuration.
+        """
+        from autosubmit.job.job import Job
+        job = Job(loaded_data=jobs_db_manager.load_job_by_name(job_data["name"]))
+        job.platform_name = self.name  # Change the original platform to this process platform.
+        job.platform = self
+        # TODO: handle missing job IDs (id=0). During an Autosubmit run, a job's log
+        # may fail to be retrieved. When recovery or setstatus or while running, later, it  tries to recover
+        # it, the job id is 0 because it was never persisted.
+        job.id = job_data["id"]
+        self._recover_job(job, jobs_db_manager, as_conf)
+
+    def recover_log_inline(self, job, as_conf: 'AutosubmitConfig | None') -> bool:
+        """Recover the given in-memory job's logs in the main process and persist the result.
+
+        Used when the recovery threads are disabled for this platform. If the jobs database is
+        unavailable the logs are still recovered in memory (the recovery counters are not
+        persisted).
+
+        :param job: Job to recover.
+        :param as_conf: Experiment configuration.
+        :return: ``True`` when the inline recovery was attempted.
+        """
+        try:
+            jobs_db_manager = JobsDbManager(schema=self.expid)
+        except Exception as e:
+            Log.warning(f"[{self.name}] Jobs database unavailable, recovering logs in memory: {e}")
+            job.retrieve_logfiles()
+            job.send_cpmip_notification(as_conf)
+            return True
+        try:
+            self._recover_job(job, jobs_db_manager, as_conf)
+        except Exception as e:
+            Log.warning(f"[{self.name}] Inline log recovery failed: {e}")
+        return True
+
     def recover_job_log(self, jobs_db_manager: 'JobsDbManager', as_conf: 'AutosubmitConfig') -> None:
         """Recovers log files for jobs from the recovery queue and retries failed jobs.
         """
-        from autosubmit.job.job import Job
         if self.recovery_queue is None:
             raise AutosubmitCritical("As the recovery job was initialized some of"
                                      "the variable were not properly initialized")
         while not self.recovery_queue.empty():
             job_data = self.recovery_queue.get(timeout=5)
-            job = Job(loaded_data=jobs_db_manager.load_job_by_name(job_data["name"]))
-            job.platform_name = self.name  # Change the original platform to this process platform.
-            job.platform = self
-            # TODO: handle missing job IDs (id=0). During an Autosubmit run, a job's log
-            # may fail to be retrieved. When recovery or setstatus or while running, later, it  tries to recover
-            # it, the job id is 0 because it was never persisted.
-            job.id = job_data["id"]
-            report = job.retrieve_logfiles()
-            job.send_cpmip_notification(self._as_conf)
-
-            if not report.all_succeeded:
-                failed = [a for a in report.attempts if a.error and "Remote logs not found" not in a.error]
-                if len(failed) > 0:
-                    Log.warning(
-                        f"{self.name}(log_recovery): Job {job.name} had "
-                        f"{len(failed)} failed recovery attempt(s): "
-                        f"{[a.error for a in failed]}"
-                    )
-                attempts = len(report.attempts) - len(failed) - 1
-            else:
-                attempts = len(report.attempts)
-            if attempts > 0:
-                Log.result(
-                    f"{self.name}(log_recovery): Job {job.name} recovered "
-                    f"{len(report.attempts)} attempt(s)."
-                )
-            jobs_db_manager.save_job_log(job)
+            self._recover_single_log(job_data, jobs_db_manager, self._as_conf)
 
     def recover_platform_job_logs(self, as_conf: 'AutosubmitConfig') -> None:
         """Recovers the logs of the jobs that have been submitted.
@@ -1081,7 +1364,7 @@ class Platform(ABC):
             self.connected = False
             self.restore_connection(as_conf, log_recovery_process=True)
             Log.result(f"{identifier} successfully connected.")
-            self.keep_alive_timeout = self.config.get("LOG_RECOVERY_TIMEOUT", 60 * 5)
+            self.keep_alive_timeout = self._as_conf.get_log_recovery_timeout()
             while not self.cleanup_event.is_set() and self.wait_for_work():
                 try:
                     self.recover_job_log(jobs_db_manager, as_conf)
