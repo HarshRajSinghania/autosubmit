@@ -345,7 +345,8 @@ class JobsDbManager(DbManager):
                 .where(and_(
                     structure_table.c.e_to == jobs_table.c.name,
                     parent_alias.c.section.notin_(sections),
-                    structure_table.c.completion_status != 'COMPLETED'
+                    structure_table.c.completion_status != 'COMPLETED',
+                    parent_alias.c.status != 'COMPLETED'
                 ))
             )
         )

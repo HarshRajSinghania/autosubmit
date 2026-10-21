@@ -16,6 +16,7 @@
 # along with Autosubmit.  If not, see <http://www.gnu.org/licenses/>.
 
 import datetime
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
 
@@ -1068,3 +1069,52 @@ def test_parse_jobs_by_filter(setup_job_list, unparsed_jobs, expected):
     job_list.parse_jobs_by_filter(unparsed_jobs)
 
     assert {job.name for job in job_list.rerun_job_list} == expected
+
+
+def _job_list_with_stale_parent_edge(as_conf) -> JobList:
+    """Return a JobList whose child is only in the DB and whose parent edge is stale."""
+    job_list = JobList(_EXPID, as_conf, YAMLParserFactory())
+
+    parent = Job("op4", 1, Status.COMPLETED, 0)
+    parent.section = "OPERATOR"
+    child = Job("app4", 2, Status.WAITING, 0)
+    child.section = "APPLICATION"
+    job_list.dbmanager.save_jobs([parent, child])
+    job_list.dbmanager.save_edges([{
+        "e_from": "op4",
+        "e_to": "app4",
+        "from_step": 0,
+        "min_trigger_status": "COMPLETED",
+        "completion_status": "WAITING",
+        "fail_ok": False,
+    }])
+
+    job_list.add_job(parent)
+    return job_list
+
+
+@pytest.mark.parametrize("load", [
+    pytest.param(
+        lambda job_list: job_list.load_wrappable_jobs_by_section("APPLICATION", set()),
+        id="parent-in-memory",
+    ),
+    pytest.param(
+        lambda job_list: job_list.load_inner_jobs_by_section(["APPLICATION"]),
+        id="parent-in-db",
+    ),
+])
+def test_wrappable_child_loaded_when_parent_completed_in_memory(
+    as_conf, load: Callable[[JobList], None]
+):
+    """Load a wrappable child when its parent is COMPLETED in memory, not only in the DB.
+
+    Regression test for the DestinE vertical-wrapper race: the parent job is
+    already COMPLETED in memory, but its edge ``completion_status`` has not been
+    persisted yet (``update_list`` runs after the packager). Neither loader may
+    skip the child in that window.
+    """
+    job_list = _job_list_with_stale_parent_edge(as_conf)
+
+    load(job_list)
+
+    assert job_list.get_job_by_name("app4") is not None

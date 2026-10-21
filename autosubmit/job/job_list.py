@@ -699,7 +699,12 @@ class JobList:
                         p_job = self.load_job_by_name(edge['e_from'])
                         if p_job:
                             loaded_tracker.add(edge['e_from'])
-                    if p_job and p_job.section != section and edge.get("completion_status", "WAITING") != "COMPLETED":
+                    if (
+                        p_job
+                        and p_job.section != section
+                        and p_job.status != Status.COMPLETED
+                        and edge.get("completion_status", "WAITING") != "COMPLETED"
+                    ):
                         can_be_loaded = False
                         break
             if can_be_loaded:
